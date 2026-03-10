@@ -105,7 +105,7 @@ func (r *registry) handleLaunchStart(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	target := instanceURL(inst.slug) + "/admin/"
+	target := instanceURL(inst.slug) + "/onboard/"
 	slog.Info("launched demo", "slug", inst.slug, "port", inst.port, "ip", ip, "expires", inst.expiresAt.Format(time.RFC3339))
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"url":%q}`, target)
