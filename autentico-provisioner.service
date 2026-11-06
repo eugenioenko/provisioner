@@ -7,7 +7,7 @@ ExecStart=/root/autentico/provisioner
 Restart=on-failure
 RestartSec=5
 
-Environment=BASE_DOMAIN=demo.autentico.top
+Environment=BASE_DOMAIN=demo.getautentico.dev
 Environment=AUTENTICO_BINARY=/root/autentico/autentico
 Environment=DATA_DIR=/root/autentico/demos
 Environment=LISTEN_ADDR=:8080

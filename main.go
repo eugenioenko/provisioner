@@ -2,7 +2,7 @@ package main
 
 import (
 	"crypto/rand"
-	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,7 +19,7 @@ import (
 )
 
 var (
-	baseDomain   = getEnv("BASE_DOMAIN", "demo.autentico.top")
+	baseDomain   = getEnv("BASE_DOMAIN", "demo.getautentico.dev")
 	baseScheme   = getEnv("BASE_SCHEME", "https")
 	basePort     = getEnv("BASE_PORT", "")
 	binary       = getEnv("AUTENTICO_BINARY", "./autentico")
@@ -34,6 +34,7 @@ type instance struct {
 	slug      string
 	port      int
 	cmd       *exec.Cmd
+	done      <-chan error
 	dir       string
 	proxy     *httputil.ReverseProxy
 	expiresAt time.Time
@@ -150,6 +151,16 @@ func (r *registry) handleProxy(w http.ResponseWriter, req *http.Request) {
 }
 
 func (r *registry) launch(creatorIP string) (*instance, error) {
+	// Resolve the executable before changing the child's working directory.
+	binaryPath, err := exec.LookPath(binary)
+	if err != nil {
+		return nil, fmt.Errorf("find autentico binary: %w", err)
+	}
+	binaryPath, err = filepath.Abs(binaryPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve autentico binary: %w", err)
+	}
+
 	slug, err := generateSlug()
 	if err != nil {
 		return nil, fmt.Errorf("generate slug: %w", err)
@@ -160,43 +171,51 @@ func (r *registry) launch(creatorIP string) (*instance, error) {
 		return nil, fmt.Errorf("find port: %w", err)
 	}
 
-	dir := filepath.Join(dataDir, slug)
-	if err := os.MkdirAll(filepath.Join(dir, "db"), 0750); err != nil {
+	dir, err := filepath.Abs(filepath.Join(dataDir, slug))
+	if err != nil {
+		return nil, fmt.Errorf("resolve data dir: %w", err)
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
+	launched := false
+	defer func() {
+		if !launched {
+			_ = os.RemoveAll(dir)
+		}
+	}()
 
-	logFile, err := os.Create(filepath.Join(dir, "autentico.log"))
+	logFile, err := os.OpenFile(filepath.Join(dir, "autentico.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("create log file: %w", err)
 	}
+	defer logFile.Close()
 
 	publicURL := instanceURL(slug)
-	cmd := exec.Command(binary, "start")
-	// Our vars come first so they take precedence over any duplicates in os.Environ()
-	// (on Linux, getenv returns the first match in the env array)
-	cmd.Env = append([]string{
-		"AUTENTICO_APP_URL=" + publicURL,
-		fmt.Sprintf("AUTENTICO_LISTEN_PORT=%d", port),
-		"AUTENTICO_DB_FILE_PATH=" + filepath.Join(dir, "db", "autentico.db"),
-		"AUTENTICO_ACCESS_TOKEN_SECRET=" + randomHex(32),
-		"AUTENTICO_REFRESH_TOKEN_SECRET=" + randomHex(32),
-		"AUTENTICO_CSRF_SECRET_KEY=" + randomHex(32),
-		"AUTENTICO_APP_ENABLE_CORS=true",
-		"AUTENTICO_CSRF_SECURE_COOKIE=true",
-		"AUTENTICO_REFRESH_TOKEN_SECURE=true",
-		"AUTENTICO_IDP_SESSION_SECURE=true",
-	}, os.Environ()...)
+	// Autentico 3.x generates all required secrets, its RSA signing key and the
+	// persistent TOTP encryption key in this instance's private .env file.
+	args := []string{"start", "--auto-setup", "--url", publicURL}
+	if baseScheme == "http" {
+		args = append(args, "--dev")
+	}
+	cmd := exec.Command(binaryPath, args...)
+	cmd.Dir = dir
+	cmd.Env = instanceEnv(os.Environ(), port)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
 		return nil, fmt.Errorf("start autentico: %w", err)
 	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+		close(done)
+	}()
 
-	if err := waitForReady(port, 3*time.Minute); err != nil {
-		cmd.Process.Kill()
-		logFile.Close()
+	if err := waitForReady(port, publicURL, done, 3*time.Minute); err != nil {
+		_ = cmd.Process.Kill()
+		<-done
 		return nil, fmt.Errorf("autentico did not start: %w", err)
 	}
 
@@ -211,6 +230,7 @@ func (r *registry) launch(creatorIP string) (*instance, error) {
 		slug:      slug,
 		port:      port,
 		cmd:       cmd,
+		done:      done,
 		dir:       dir,
 		proxy:     proxy,
 		expiresAt: time.Now().Add(demoTTL),
@@ -221,24 +241,45 @@ func (r *registry) launch(creatorIP string) (*instance, error) {
 	r.instances[slug] = inst
 	r.mu.Unlock()
 
+	launched = true
 	return inst, nil
+}
+
+// An instance must never inherit another Autentico installation's secrets,
+// database, URL or cookie policy. Its own .env supplies those settings.
+func instanceEnv(parent []string, port int) []string {
+	env := make([]string, 0, len(parent)+2)
+	for _, entry := range parent {
+		if !strings.HasPrefix(entry, "AUTENTICO_") {
+			env = append(env, entry)
+		}
+	}
+	return append(env,
+		fmt.Sprintf("AUTENTICO_LISTEN_PORT=%d", port),
+		// The provisioner's reverse proxy connects over loopback.
+		"AUTENTICO_TRUSTED_PROXIES=127.0.0.1/32,::1/128",
+	)
 }
 
 func (r *registry) runCleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		r.mu.Lock()
-		for slug, inst := range r.instances {
-			if time.Now().After(inst.expiresAt) {
-				slog.Info("expiring demo", "slug", slug)
-				_ = inst.cmd.Process.Kill()
-				_ = inst.cmd.Wait()
-				_ = os.RemoveAll(inst.dir)
-				delete(r.instances, slug)
-			}
+		r.cleanupExpired(time.Now())
+	}
+}
+
+func (r *registry) cleanupExpired(now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for slug, inst := range r.instances {
+		if !now.Before(inst.expiresAt) {
+			slog.Info("expiring demo", "slug", slug)
+			_ = inst.cmd.Process.Kill()
+			<-inst.done
+			_ = os.RemoveAll(inst.dir)
+			delete(r.instances, slug)
 		}
-		r.mu.Unlock()
 	}
 }
 
@@ -571,21 +612,34 @@ func freePort() (int, error) {
 	return port, nil
 }
 
-// waitForReady polls the OIDC discovery endpoint until it returns 200,
-// which means the instance is fully initialised and ready to serve traffic.
-func waitForReady(port int, timeout time.Duration) error {
+// waitForReady checks the expected issuer, so an unrelated process on a reused
+// port cannot be mistaken for the newly launched instance.
+func waitForReady(port int, publicURL string, done <-chan error, timeout time.Duration) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(timeout)
-	addr := fmt.Sprintf("http://localhost:%d/.well-known/openid-configuration", port)
+	addr := fmt.Sprintf("http://127.0.0.1:%d/.well-known/openid-configuration", port)
 	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			return fmt.Errorf("process exited before becoming ready: %v", err)
+		default:
+		}
 		resp, err := client.Get(addr)
 		if err == nil {
+			var discovery struct {
+				Issuer string `json:"issuer"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&discovery)
 			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
+			if resp.StatusCode == http.StatusOK && decodeErr == nil && discovery.Issuer == publicURL+"/oauth2" {
 				return nil
 			}
 		}
-		time.Sleep(1 * time.Second)
+		select {
+		case err := <-done:
+			return fmt.Errorf("process exited before becoming ready: %v", err)
+		case <-time.After(200 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("instance on port %d not ready after %s", port, timeout)
 }
@@ -604,12 +658,6 @@ func clientIP(req *http.Request) string {
 	}
 	host, _, _ := net.SplitHostPort(req.RemoteAddr)
 	return host
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // instanceURL builds the public-facing URL for a demo slug.

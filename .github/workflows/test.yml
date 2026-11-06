@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: Autentico ${{ matrix.autentico }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        autentico: [v3.0.0, v3.2.0]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Download released Autentico
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTENTICO_VERSION: ${{ matrix.autentico }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/autentico"
+          gh release download "$AUTENTICO_VERSION" --repo eugenioenko/autentico \
+            --pattern autentico-linux-amd64 --dir "$RUNNER_TEMP/autentico"
+          chmod +x "$RUNNER_TEMP/autentico/autentico-linux-amd64"
+      - name: Test with real Autentico
+        run: AUTENTICO_TEST_BINARY="$RUNNER_TEMP/autentico/autentico-linux-amd64" go test -race -v ./...
+      - name: Vet
+        run: go vet ./...
